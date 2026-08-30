@@ -1,0 +1,2 @@
+AppDeployments/**/*.msi filter=lfs diff=lfs merge=lfs -text
+AppDeployments/**/*.exe filter=lfs diff=lfs merge=lfs -text
