@@ -1,12 +1,9 @@
 #requires -Version 5.1
-<#  HelpDesk-Maintenance.UITest.ps1
-    UI-only walkthrough of the LZFD Karlsruhe maintenance flow.
-    NO real actions — every step is simulated. Use the dropdown at the bottom
-    to force the next step to Success or Failure.  Run:  powershell -sta -File .\HelpDesk-Maintenance.UITest.ps1
+<#  HelpDesk-Maintenance.UITest.ps1  (app2.ps1)
+    UI-only walkthrough. NO real actions. ASCII-only (no em-dashes) to avoid encoding breakage.
 #>
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-# ---- palette (matches your mockup: red actions, green cancel, blue borders) ----
 $Clr = @{ Action='#C00000'; Cancel='#2E7D32'; Accent='#1F4E79'; Ink='#111111' }
 $script:Flow = [ordered]@{ Domain=$null; User=$null; PC=$null; Selection=$null }
 
@@ -54,7 +51,6 @@ function New-Screen {
 }
 function Set-Screen { param($el) $script:ContentHost.Content=$el }
 
-# ---------------- screens ----------------
 function Show-Login {
     $s=New-Screen
     $s.Children.Add((Row @((New-Btn 'Login' $Clr.Action { Show-Domain }),(New-Btn 'Cancel' $Clr.Cancel { $script:Win.Close() }))))|Out-Null
@@ -62,7 +58,7 @@ function Show-Login {
 }
 function Show-Domain {
     $s=New-Screen
-    1..4 | ForEach-Object { $tb=New-Object System.Windows.Controls.TextBlock; $tb.Text="$_.  —  Domain $_"; $tb.FontSize=14; $tb.Margin=(T 0,2,0,2); $s.Children.Add($tb)|Out-Null }
+    1..4 | ForEach-Object { $tb=New-Object System.Windows.Controls.TextBlock; $tb.Text="$_.  -  Domain $_"; $tb.FontSize=14; $tb.Margin=(T 0,2,0,2); $s.Children.Add($tb)|Out-Null }
     $combo=New-Object System.Windows.Controls.ComboBox; $combo.Width=220; $combo.HorizontalAlignment='Left'; $combo.Margin=(T 0,10,0,0)
     1..4 | ForEach-Object { $combo.Items.Add("Domain $_")|Out-Null }; $combo.SelectedIndex=0
     $s.Children.Add($combo)|Out-Null
@@ -93,14 +89,14 @@ function Show-Analyzing {
     $timer.Start()
 }
 function Show-EnterPC {
-    $s=New-Screen 'Successful — Enter PC Name'
+    $s=New-Screen 'Successful - Enter PC Name'
     $pc=New-Input 'Computer Name'; $s.Children.Add($pc)|Out-Null
     $connect=New-Btn 'Connect' $Clr.Action { $script:Flow.PC=(Get-Val $pc); if((Get-Sim) -eq 'Success'){ Show-Read } else { Show-Failed { Show-EnterPC } } }
     $s.Children.Add((Row @($connect,(New-Btn 'Cancel' $Clr.Cancel { Show-Login }))))|Out-Null
     Set-Screen $s
 }
 function Show-Read {
-    $s=New-Screen 'Successful — Read the Reg Keys'
+    $s=New-Screen 'Successful - Read the Reg Keys'
     $read=New-Btn 'Read' $Clr.Action { if((Get-Sim) -eq 'Success'){ Show-RegList } else { Show-Failed { Show-Read } } }
     $s.Children.Add((Row @($read,(New-Btn 'Cancel' $Clr.Cancel { Show-Login }))))|Out-Null
     Set-Screen $s
@@ -115,7 +111,7 @@ function Show-RegList {
     Set-Screen $s
 }
 function Show-Reboot {
-    $s=New-Screen 'Successful — Trigger Reboot'
+    $s=New-Screen 'Successful - Trigger Reboot'
     $s.Children.Add((Row @((New-Btn 'Reboot' $Clr.Action { Show-Done }),(New-Btn 'Close' $Clr.Cancel { $script:Win.Close() }))))|Out-Null
     Set-Screen $s
 }
@@ -132,9 +128,8 @@ function Show-Failed {
     Set-Screen $s
 }
 
-# ---------------- window shell + test bar ----------------
 $script:Win = New-Object System.Windows.Window
-$Win.Title='IT Help Desk — LZFD Karlsruhe (UI TEST)'; $Win.Width=580; $Win.Height=600
+$Win.Title='IT Help Desk - LZFD Karlsruhe (UI TEST)'; $Win.Width=580; $Win.Height=600
 $Win.WindowStartupLocation='CenterScreen'; $Win.Background=(C '#f4f4ef')
 
 $outer=New-Object System.Windows.Controls.Grid; $outer.Margin=(T 14)
@@ -147,7 +142,7 @@ $script:ContentHost=New-Object System.Windows.Controls.ContentControl; $frame.Ch
 [System.Windows.Controls.Grid]::SetRow($frame,0); $outer.Children.Add($frame)|Out-Null
 
 $bar=New-Object System.Windows.Controls.StackPanel; $bar.Orientation='Horizontal'; $bar.Margin=(T 4,10,0,0)
-$blbl=New-Object System.Windows.Controls.TextBlock; $blbl.Text='TEST — simulate next step: '; $blbl.VerticalAlignment='Center'; $blbl.Foreground=(C '#666')
+$blbl=New-Object System.Windows.Controls.TextBlock; $blbl.Text='TEST - simulate next step: '; $blbl.VerticalAlignment='Center'; $blbl.Foreground=(C '#666')
 $script:SimCombo=New-Object System.Windows.Controls.ComboBox; $SimCombo.Width=120; $SimCombo.Items.Add('Success')|Out-Null; $SimCombo.Items.Add('Failure')|Out-Null; $SimCombo.SelectedIndex=0
 $bar.Children.Add($blbl)|Out-Null; $bar.Children.Add($script:SimCombo)|Out-Null
 [System.Windows.Controls.Grid]::SetRow($bar,1); $outer.Children.Add($bar)|Out-Null
