@@ -145,7 +145,7 @@ while ($state -and $state -ne 'Exit') {
         }
 
         'Password' {
-            $r = Show-ADTInstallationPrompt @UCMBase -RequestInput -SecureInput -Message "Enter password for $script:UCMUser :" -ButtonRightText 'Login'
+            $r = Show-ADTInstallationPrompt @UCMBase -RequestInput -Message "Enter password for $script:UCMUser :" -ButtonRightText 'Login'
             $pw = Get-UCMInputText $r
             if ([string]::IsNullOrWhiteSpace($pw)) { $state='Login' }
             else {
