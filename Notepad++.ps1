@@ -58,6 +58,19 @@ Function Register-ResumeTask {
     Write-Log 'Resume-Task registriert.'
 }
 
+Function Remove-PersistFolder {
+    # Selbstlöschung zeitverzögert, damit der laufende Prozess die EXE freigibt
+    $cmd = "Start-Sleep -Seconds 15; Remove-Item -LiteralPath '$PkgPersist' -Recurse -Force; " +
+           "Unregister-ScheduledTask -TaskName 'PSADT-Cleanup-$AppName' -Confirm:`$false"
+    $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
+    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(5)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName "PSADT-Cleanup-$AppName" -Action $action -Trigger $trigger `
+        -Principal $principal -Force | Out-Null
+    Write-Log 'Aufräum-Task für Persist-Ordner geplant.'
+}
+
 Function Complete-StagedInstall {
     # Aufräumen nach der letzten Stufe: Resume-Task und Stage-Schlüssel entfernen.
     # Die persistente Kopie ($PkgPersist) wird bewusst nicht gelöscht, da der Prozess
