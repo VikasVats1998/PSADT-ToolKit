@@ -112,11 +112,12 @@ Function Uninstall_NotepadPP {
 switch ($adtSession.DeploymentType) {
 
     'Uninstall' {
+        Show-ADTInstallationPrompt -Message 'Deinstallation Notepad++ - Start.' -ButtonRightText 'OK'
         Uninstall_NotepadPP
-        Complete-StagedInstall   # evtl. offenes Stage-Tracking / Resume-Task entfernen
+        Complete-StagedInstall     # offenes Stage-Tracking / Resume-Task entfernen
     }
 
-    default {   # Install / Repair
+    default {   # Install / Repair - stufenweise
         $current = Get-InstallLevel
         Write-Log "Setze Installation bei Stufe $current fort."
 
@@ -126,18 +127,17 @@ switch ($adtSession.DeploymentType) {
 
                 0 {
                     Write-Log 'Stufe 0: Vorbereitung - Start.'
+                    Show-ADTInstallationPrompt -Message 'Stufe 0: Vorbereitung - Start.' -ButtonRightText 'OK'
                     Copy-PackageToPersist
-                    # <-- weitere Vorbereitungsschritte hier
                     Set-InstallLevel 1
-                    $current = 1          # kein Neustart -> direkt weiter
+                    $current = 1
                 }
 
                 1 {
-                    Write-Log 'Stufe 1: Installation - Start.'
-                    Install_NotepadPP
+                    Write-Log 'Stufe 1: Deinstallation Altversion - Start.'
+                    Show-ADTInstallationPrompt -Message 'Stufe 1: Deinstallation - Start.' -ButtonRightText 'OK'
+                    Uninstall_NotepadPP
                     Set-InstallLevel 2
-
-                    # Neustart-Stufe: Resume-Task setzen, dann mit 3010 beenden
                     Register-ResumeTask
                     Write-Log 'Neustart erforderlich. Beende mit 3010.'
                     Close-ADTSession -ExitCode 3010
@@ -145,10 +145,21 @@ switch ($adtSession.DeploymentType) {
                 }
 
                 2 {
-                    Write-Log 'Stufe 2: Nachbereitung nach Neustart - Start.'
-                    # <-- Konfiguration nach dem Neustart hier
+                    Write-Log 'Stufe 2: Installation - Start.'
+                    Show-ADTInstallationPrompt -Message 'Stufe 2: Installation - Start.' -ButtonRightText 'OK'
+                    Install_NotepadPP
                     Set-InstallLevel 3
-                    $current = 3
+                    Register-ResumeTask
+                    Write-Log 'Neustart erforderlich. Beende mit 3010.'
+                    Close-ADTSession -ExitCode 3010
+                    return
+                }
+
+                3 {
+                    Write-Log 'Stufe 3: Nachbereitung nach Neustart - Start.'
+                    Show-ADTInstallationPrompt -Message 'Stufe 3: Nachbereitung - Start.' -ButtonRightText 'OK'
+                    Set-InstallLevel 4
+                    $current = 4
                 }
 
                 default {
