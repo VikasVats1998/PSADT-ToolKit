@@ -7,3 +7,14 @@ inner join SMS_G_System_COMPUTER_SYSTEM on SMS_G_System_COMPUTER_SYSTEM.Resource
 inner join SMS_G_System_COMPUTER_SYSTEM_PRODUCT on SMS_G_System_COMPUTER_SYSTEM_PRODUCT.ResourceID = SMS_R_System.ResourceId
 inner join SMS_G_System_PC_BIOS on SMS_G_System_PC_BIOS.ResourceID = SMS_R_System.ResourceId
 where SMS_G_System_COMPUTER_SYSTEM.Manufacturer like "LENOVO%"
+
+
+
+
+
+select SMS_G_System_COMPUTER_SYSTEM_PRODUCT.Version,
+       SMS_G_System_PC_BIOS.SMBIOSBIOSVersion
+from SMS_R_System
+inner join SMS_G_System_COMPUTER_SYSTEM_PRODUCT on SMS_G_System_COMPUTER_SYSTEM_PRODUCT.ResourceID = SMS_R_System.ResourceId
+inner join SMS_G_System_PC_BIOS on SMS_G_System_PC_BIOS.ResourceID = SMS_R_System.ResourceId
+where SMS_G_System_PC_BIOS.Manufacturer like "LENOVO%"
