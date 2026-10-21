@@ -1,0 +1,558 @@
+<#
+    Install_Drivers.ps1
+    Lenovo Treiber / BIOS / Firmware ueber Lenovo System Update (TVSU) - PSADT v4
+    Aufruf aus Invoke-AppDeployToolkit.ps1 (Install-Phase):
+        & "$PSScriptRoot\Install_Drivers.ps1"
+        Close-ADTSession -ExitCode $LASTEXITCODE
+
+    Unterstuetzte Geraete (Win32_BaseBoard.Product):
+        334A           ThinkCentre M75q Gen 5        Desktop   keine NVIDIA
+        334B           ThinkCentre M70q Gen 5        Desktop   keine NVIDIA
+        330B           ThinkCentre M70q Gen 3        Desktop   keine NVIDIA
+        32CB           ThinkCentre M70q/M70s Gen 3   Desktop   NVIDIA nur mit Steckkarte (M70s)
+        3135           ThinkCentre M920x Tiny        Desktop   optional AMD, keine NVIDIA
+        20YQ* / 20YR*  ThinkPad P15 Gen 2            Laptop    NVIDIA (T1200 / RTX A-Serie)
+        11TB*          Modell noch pruefen           Platzhalter
+
+    Repository-Suche (Lenovo_Repository\...):
+        1. <BoardID>_W11        z.B. 330B_W11
+        2. <MTM>_W11            z.B. 20YRS7PD00_W11
+        3. <MTM 4 Zeichen>*_W11 z.B. 20YR*_W11
+
+    Exit-Codes (vom Skript gesetzt, TVSU liefert keine):
+        0      Nichts zu tun / installiert ohne Neustart
+        3010   Updates installiert, Neustart-Aufforderung angezeigt
+        60001  TVSU nicht installiert
+        60002  Repository nicht gefunden
+        60003  Geraet nicht unterstuetzt
+        60004  TVSU Timeout
+        60005  Updates fehlgeschlagen
+
+    Version: 21-10-2026
+#>
+
+#region Variablen
+$LogFilePath       = 'C:\Logs'
+$LogFile           = 'Lenovo_Install_Drivers.log'
+$ScriptVersion     = '21-10-2026'
+$CurrentPath       = $PSScriptRoot
+$TvsuExe           = "${env:ProgramFiles(x86)}\Lenovo\System Update\tvsu.exe"
+$TvsuPolicyKey     = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
+$TvsuPrefsKey      = 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings'
+$TvsuTimeoutMin    = 55      # max runtime of TVSU per run
+$MinBatteryPercent = 30      # min charge for BIOS update on laptops
+$ChargerRetries    = 3       # how often the user is asked to plug in the charger
+$UseListCheck      = $true   # pre-check with "-action LIST"; set $false if LIST does not fill WMI
+#endregion
+
+#region Allgemeine Funktionen
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Source = 'Hauptprogramm',
+        [ValidateSet('Info','Warning','Error')][string]$Severity = 'Info'
+    )
+    Write-ADTLogEntry -Message $Message -Source $Source -Severity $Severity `
+        -LogFileDirectory $LogFilePath -LogFileName $LogFile -LogType CMTrace
+}
+#endregion
+
+#region Geraeteerkennung
+function Test-NvidiaGpu {
+    # Hardware ID VEN_10DE = NVIDIA, works even without installed driver
+    $gpu = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction SilentlyContinue |
+           Where-Object { $_.PNPDeviceID -like 'PCI\VEN_10DE*' -and $_.PNPClass -eq 'Display' }
+    return [bool]$gpu
+}
+
+function Find-Repository {
+    param([string]$Board, [string]$Mtm)
+    $root = Join-Path $CurrentPath 'Lenovo_Repository'
+
+    foreach ($name in @("$($Board)_W11", "$($Mtm)_W11")) {
+        $path = Join-Path $root $name
+        if (Test-Path -Path $path) { return $path }
+    }
+
+    if ($Mtm.Length -ge 4) {
+        $match = Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like "$($Mtm.Substring(0,4))*_W11" } |
+                 Select-Object -First 1
+        if ($match) { return $match.FullName }
+    }
+    return $null
+}
+
+function Get-DeviceProfile {
+    $board = ((Get-CimInstance -ClassName Win32_BaseBoard).Product).Trim()
+    $mtm   = ((Get-CimInstance -ClassName Win32_ComputerSystem).Model).Trim()
+    $model = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).Version
+
+    switch -Regex ($board) {
+        '^334A$'   { $name = 'ThinkCentre M75q Gen 5';       $laptop = $false }
+        '^334B$'   { $name = 'ThinkCentre M70q Gen 5';       $laptop = $false }
+        '^330B$'   { $name = 'ThinkCentre M70q Gen 3';       $laptop = $false }
+        '^32CB$'   { $name = 'ThinkCentre M70q/M70s Gen 3';  $laptop = $false }
+        '^3135$'   { $name = 'ThinkCentre M920x Tiny';       $laptop = $false }
+        '^20Y[QR]' { $name = 'ThinkPad P15 Gen 2';           $laptop = $true  }
+        '^11TB'    { $name = 'Lenovo 11TB (Modell pruefen)'; $laptop = $false }
+        default    { return $null }
+    }
+
+    # Safety net: a battery means laptop, regardless of the table
+    if (Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue) { $laptop = $true }
+
+    [pscustomobject]@{
+        Board      = $board
+        Mtm        = $mtm
+        Model      = $model
+        Name       = $name
+        IsLaptop   = $laptop
+        HasNvidia  = Test-NvidiaGpu
+        Repository = Find-Repository -Board $board -Mtm $mtm
+    }
+}
+#endregion
+
+#region Akku / Netzteil
+function Get-PowerState {
+    $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue
+    if (-not $battery) {
+        return [pscustomobject]@{ HasBattery = $false; OnAC = $true; Charge = 100 }
+    }
+
+    $onAC = $null
+    try {
+        $status = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction Stop |
+                  Where-Object Active
+        if ($status) { $onAC = [bool]($status.PowerOnline -contains $true) }
+    } catch { }
+
+    # Fallback: BatteryStatus 1/4/5 = discharging (running on battery)
+    if ($null -eq $onAC) {
+        $onAC = [bool]($battery | Where-Object { $_.BatteryStatus -notin 1,4,5 })
+    }
+
+    $charge = [int](($battery | Measure-Object -Property EstimatedChargeRemaining -Average).Average)
+    [pscustomobject]@{ HasBattery = $true; OnAC = $onAC; Charge = $charge }
+}
+
+function Confirm-PowerForBios {
+    param($Device)
+    $src = 'Confirm-PowerForBios'
+
+    if (-not $Device.IsLaptop) {
+        Write-Log "Desktop-Geraet ($($Device.Name)) - Netzbetrieb, BIOS/Firmware-Updates erlaubt." $src
+        return $true
+    }
+
+    for ($i = 1; $i -le $ChargerRetries; $i++) {
+        $power = Get-PowerState
+        Write-Log "Pruefung $i/$ChargerRetries - Netzteil: $($power.OnAC), Akku: $($power.Charge)%" $src
+
+        if ($power.OnAC -and $power.Charge -ge $MinBatteryPercent) {
+            Write-Log 'Netzteil angeschlossen und Akku ausreichend - BIOS/Firmware-Updates erlaubt.' $src
+            return $true
+        }
+
+        if (-not $power.OnAC) {
+            $msg = "Das Geraet laeuft im Akkubetrieb.`n`nBitte schliessen Sie jetzt das Netzteil an, damit auch BIOS- und Firmware-Updates installiert werden koennen."
+        } else {
+            $msg = "Der Akku ist nur zu $($power.Charge)% geladen (mindestens $MinBatteryPercent% noetig).`n`nBitte lassen Sie das Netzteil angeschlossen und pruefen Sie in einigen Minuten erneut."
+        }
+
+        # No -Icon: not supported with the Fluent UI in config.psd1
+        $answer = Show-ADTInstallationPrompt -Message $msg -ButtonLeftText 'Ohne BIOS' `
+                    -ButtonRightText 'Erneut pruefen' -Timeout 300 -NoExitOnTimeout -PersistPrompt
+
+        if ($answer -eq 'Ohne BIOS') {
+            Write-Log 'Benutzer hat "Ohne BIOS" gewaehlt.' $src 'Warning'
+            break
+        }
+    }
+
+    Write-Log 'Kein sicherer Netzbetrieb - es werden nur Treiber und Anwendungen installiert, KEIN BIOS/Firmware.' $src 'Warning'
+    return $false
+}
+#endregion
+
+#region TVSU
+function Initialize-TvsuSettings {
+    $src = 'Initialize-TvsuSettings'
+
+    Remove-Item -Path 'HKLM:\SOFTWARE\Policies\Lenovo' -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -Path $TvsuPolicyKey -Force | Out-Null
+
+    Set-ItemProperty -Path "$TvsuPrefsKey\Scheduler" -Name 'SchedulerAbility' -Value 'NO' -ErrorAction SilentlyContinue
+
+    $general = "$TvsuPrefsKey\General"
+    $values  = [ordered]@{
+        DebugEnable              = 'YES'
+        DisplayInformationScreen = 'YES'
+        DisplayLicenseNotice     = 'NO'
+        DisplayLicenseNoticeSU   = 'NO'
+        IgnoreLocalLicense       = 'YES'
+        AskBeforeClosing         = 'NO'
+        EULAAccepted             = 'YES'
+    }
+    foreach ($name in $values.Keys) {
+        Set-ItemProperty -Path $general -Name $name -Value $values[$name] -ErrorAction SilentlyContinue
+    }
+
+    Disable-ScheduledTask -TaskName 'TVT\TVSUUpdateTask_UserLogOn' -ErrorAction SilentlyContinue | Out-Null
+    Write-Log 'TVSU-Einstellungen gesetzt.' $src
+}
+
+function Set-TvsuCommandLine {
+    param(
+        [ValidateSet('LIST','INSTALL')][string]$Action,
+        [string]$PackageTypes,
+        [string]$Repository
+    )
+    # PackageTypes: 1 = Application, 2 = Driver, 3 = BIOS, 4 = Firmware
+    $cmd = "/CM -search A -action $Action -packagetypes $PackageTypes -includerebootpackages 1,3,4,5 " +
+           "-noreboot -noicon -repository $Repository -nolicense -exporttowmi"
+
+    New-ItemProperty -Path $TvsuPolicyKey -Name 'AdminCommandLine' -PropertyType String -Value $cmd -Force | Out-Null
+    Write-Log "TVSU AdminCommandLine: $cmd" 'Set-TvsuCommandLine'
+}
+
+function Clear-TvsuResults {
+    try {
+        Get-CimInstance -Namespace root\Lenovo -ClassName Lenovo_Updates -ErrorAction Stop |
+            Remove-CimInstance -ErrorAction Stop
+    } catch {
+        Write-Log 'Keine alten TVSU-Ergebnisse in WMI vorhanden.' 'Clear-TvsuResults'
+    }
+}
+
+function Get-TvsuResults {
+    try   { return @(Get-CimInstance -Namespace root\Lenovo -ClassName Lenovo_Updates -ErrorAction Stop) }
+    catch { return @() }
+}
+
+function Invoke-Tvsu {
+    param([string]$StatusMessage)
+    $src = 'Invoke-Tvsu'
+
+    Show-ADTInstallationProgress -StatusMessage $StatusMessage
+    Write-Log "Starte TVSU: $TvsuExe /CM" $src
+
+    # TVSU returns no usable exit code and hands over to Tvsukernel.exe,
+    # so start without waiting and watch the processes ourselves.
+    Start-ADTProcess -FilePath $TvsuExe -ArgumentList '/CM' -NoWait
+    Start-Sleep -Seconds 15
+
+    $deadline = (Get-Date).AddMinutes($TvsuTimeoutMin)
+    while (Get-Process -Name 'tvsu','Tvsukernel' -ErrorAction SilentlyContinue) {
+        if ((Get-Date) -gt $deadline) {
+            Write-Log "TVSU laeuft laenger als $TvsuTimeoutMin Minuten - Abbruch." $src 'Error'
+            return $false
+        }
+        Start-Sleep -Seconds 15
+    }
+
+    Write-Log 'TVSU-Prozess beendet.' $src
+    return $true
+}
+#endregion
+
+#region NVIDIA
+function Get-InfDriverVersion {
+    param([string]$InfPath)
+    # Line looks like: DriverVer = 06/10/2024,31.0.15.5222
+    $line = Select-String -Path $InfPath -Pattern '^\s*DriverVer\s*=' | Select-Object -First 1
+    if (-not $line) { return $null }
+    $ver = (($line.Line -split ',')[-1] -replace ';.*$','').Trim()
+    try { return [version]$ver } catch { return $null }
+}
+
+function Get-InstalledNvidiaDriverVersion {
+    $drv = Get-CimInstance -ClassName Win32_PnPSignedDriver -Filter "DeviceClass='DISPLAY'" -ErrorAction SilentlyContinue |
+           Where-Object { $_.DeviceID -like 'PCI\VEN_10DE*' -and $_.DriverProviderName -like '*NVIDIA*' } |
+           Select-Object -First 1
+    if ($drv -and $drv.DriverVersion) {
+        try { return [version]$drv.DriverVersion } catch { }
+    }
+    return $null
+}
+
+function Install-NvidiaDisplayDriver {
+    # Returns: 'None', 'Installed', 'Reboot' or 'Failed'
+    param([string]$Repository)
+    $src        = 'Install-NvidiaDisplayDriver'
+    $driverPath = "$Repository\Nvidia Treiber\Display.Driver"
+
+    $infs = Get-ChildItem -Path $driverPath -Filter 'nv*.inf' -File -ErrorAction SilentlyContinue
+    if (-not $infs) {
+        Write-Log "Keine NVIDIA INF-Dateien unter $driverPath gefunden - Grafiktreiber wird uebersprungen." $src 'Warning'
+        return 'None'
+    }
+
+    $repoVersion = $infs | ForEach-Object { Get-InfDriverVersion -InfPath $_.FullName } |
+                   Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+    $installedVersion = Get-InstalledNvidiaDriverVersion
+    $installedText    = if ($installedVersion) { $installedVersion } else { 'keiner' }
+    Write-Log "NVIDIA Grafiktreiber - installiert: $installedText, Repository: $repoVersion" $src
+
+    if ($installedVersion -and $repoVersion -and $installedVersion -ge $repoVersion) {
+        Write-Log 'NVIDIA Grafiktreiber ist aktuell - keine Installation noetig.' $src
+        return 'None'
+    }
+
+    Show-ADTInstallationProgress -StatusMessage 'NVIDIA Grafiktreiber wird installiert. Der Bildschirm kann kurz flackern...'
+    try {
+        # 0 = OK, 259 = no device updated, 3010 = restart required
+        $result = Start-ADTProcess -FilePath "$env:SystemRoot\System32\pnputil.exe" `
+                    -ArgumentList "/add-driver `"$driverPath\*.inf`" /install" `
+                    -CreateNoWindow -IgnoreExitCodes 259,3010 -PassThru
+        Write-Log "pnputil Exit-Code: $($result.ExitCode)" $src
+
+        switch ($result.ExitCode) {
+            0       { Write-Log 'NVIDIA Grafiktreiber erfolgreich installiert.' $src; return 'Installed' }
+            3010    { Write-Log 'NVIDIA Grafiktreiber installiert - Neustart erforderlich.' $src; return 'Reboot' }
+            259     { Write-Log 'pnputil: kein Geraet aktualisiert (Treiber passt nicht oder ist bereits aktiv).' $src 'Warning'; return 'None' }
+            default { Write-Log "NVIDIA Grafiktreiber: unerwarteter Exit-Code $($result.ExitCode)." $src 'Error'; return 'Failed' }
+        }
+    } catch {
+        Write-Log "Fehler bei der Installation des NVIDIA Grafiktreibers: $($_.Exception.Message)" $src 'Error'
+        return 'Failed'
+    }
+}
+
+function Install-NvidiaControlPanel {
+    param([string]$Repository)
+    $src     = 'Install-NvidiaControlPanel'
+    $nvcpl   = "$Repository\Nvidia Treiber\Display.Driver\NVCPL"
+    $appx    = Get-ChildItem -Path $nvcpl -Filter '*.appx'         -ErrorAction SilentlyContinue | Select-Object -First 1
+    $license = Get-ChildItem -Path $nvcpl -Filter '*_License1.xml' -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if (-not $appx -or -not $license) {
+        Write-Log "NVIDIA Control Panel Appx/Lizenz nicht gefunden unter $nvcpl - wird uebersprungen." $src 'Warning'
+        return
+    }
+
+    # Read version directly from AppxManifest.xml inside the appx (no extract needed)
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($appx.FullName)
+        try {
+            $reader = New-Object System.IO.StreamReader($zip.GetEntry('AppxManifest.xml').Open())
+            [xml]$manifest = $reader.ReadToEnd()
+            $reader.Close()
+        } finally { $zip.Dispose() }
+        $repoVersion = [version]$manifest.Package.Identity.Version
+    } catch {
+        Write-Log "Version der Appx konnte nicht gelesen werden: $($_.Exception.Message)" $src 'Error'
+        return
+    }
+
+    $installed = Get-AppxProvisionedPackage -Online | Where-Object DisplayName -eq 'NVIDIACorp.NVIDIAControlPanel'
+    $installedVersion = if ($installed) { [version]$installed.Version } else { [version]'0.0.0.0' }
+    Write-Log "NVIDIA Control Panel - installiert: $installedVersion, Repository: $repoVersion" $src
+
+    if ($installedVersion -ge $repoVersion) {
+        Write-Log 'NVIDIA Control Panel ist aktuell - keine Aktualisierung noetig.' $src
+        return
+    }
+
+    Show-ADTInstallationProgress -StatusMessage 'NVIDIA Control Panel wird installiert...'
+    try {
+        Add-AppxProvisionedPackage -Online -PackagePath $appx.FullName -LicensePath $license.FullName `
+            -LogPath 'C:\Logs\Nvidia_Control_Panel.log' -ErrorAction Stop | Out-Null
+        Write-Log 'NVIDIA Control Panel erfolgreich installiert.' $src
+    } catch {
+        Write-Log "Fehler bei der Installation des NVIDIA Control Panel: $($_.Exception.Message)" $src 'Error'
+    }
+}
+#endregion
+
+#region BitLocker
+function Suspend-BitLockerOnce {
+    $src = 'Suspend-BitLockerOnce'
+    try {
+        $vol = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
+        if ($vol.ProtectionStatus -eq 'On') {
+            Suspend-BitLocker -MountPoint 'C:' -RebootCount 1 -ErrorAction Stop | Out-Null
+            Write-Log 'BitLocker fuer 1 Neustart angehalten (BIOS-Update).' $src
+            return $true
+        }
+        Write-Log "BitLocker-Schutz ist bereits '$($vol.ProtectionStatus)'." $src
+    } catch {
+        Write-Log "BitLocker konnte nicht angehalten werden: $($_.Exception.Message)" $src 'Warning'
+    }
+    return $false
+}
+#endregion
+
+#region Hauptprogramm
+$Phase           = 'Init'
+$ExitCode        = 0
+$AllowBios       = $false
+$PackageTypes    = '1,2'
+$BitLockerPaused = $false
+$RebootNeeded    = $false
+$NvidiaChanged   = $false
+$NvidiaFailed    = $false
+$Device          = $null
+
+while ($Phase -ne 'Done') {
+    switch ($Phase) {
+
+        'Init' {
+            Write-Log "Lenovo Treiber-Skript gestartet - Version $ScriptVersion"
+
+            if (-not (Test-Path -Path $TvsuExe)) {
+                $msg = 'Fehler: Lenovo System Update (tvsu.exe) wurde nicht gefunden. Das Programm wird beendet.'
+                Show-ADTInstallationPrompt -Message $msg -ButtonRightText 'OK'
+                Write-Log $msg -Severity 'Error'
+                $ExitCode = 60001; $Phase = 'Done'; continue
+            }
+
+            $Device = Get-DeviceProfile
+            if (-not $Device) {
+                $board = (Get-CimInstance -ClassName Win32_BaseBoard).Product
+                $msg = "Fehler: Dieses Geraet (Board $board) wird vom Skript nicht unterstuetzt."
+                Show-ADTInstallationPrompt -Message $msg -ButtonRightText 'OK'
+                Write-Log $msg -Severity 'Error'
+                $ExitCode = 60003; $Phase = 'Done'; continue
+            }
+
+            Write-Log ("Geraet: {0} ({1}) | Board: {2} | MTM: {3} | Laptop: {4} | NVIDIA-GPU: {5}" -f `
+                $Device.Name, $Device.Model, $Device.Board, $Device.Mtm, $Device.IsLaptop, $Device.HasNvidia)
+
+            if (-not $Device.Repository) {
+                $msg = 'Fehler: Das Lenovo Treiber Repository wurde nicht gefunden. Der Lenovo System Updater wird nicht gestartet!'
+                Show-ADTInstallationPrompt -Message $msg -ButtonRightText 'OK'
+                Write-Log "$msg (Board: $($Device.Board), MTM: $($Device.Mtm))" -Severity 'Error'
+                $ExitCode = 60002; $Phase = 'Done'; continue
+            }
+            Write-Log "Repository: $($Device.Repository)"
+
+            Initialize-TvsuSettings
+            $Phase = 'CheckPower'
+        }
+
+        'CheckPower' {
+            $AllowBios    = Confirm-PowerForBios -Device $Device
+            $PackageTypes = if ($AllowBios) { '1,2,3,4' } else { '1,2' }
+            $Phase = 'CheckUpdates'
+        }
+
+        'CheckUpdates' {
+            if (-not $UseListCheck) { $Phase = 'Install'; continue }
+
+            Set-TvsuCommandLine -Action 'LIST' -PackageTypes $PackageTypes -Repository $Device.Repository
+            Clear-TvsuResults
+
+            if (-not (Invoke-Tvsu -StatusMessage 'Suche nach Treiber- und BIOS-Updates...')) {
+                $ExitCode = 60004; $Phase = 'Done'; continue
+            }
+
+            $found   = Get-TvsuResults
+            $pending = @($found | Where-Object { $_.Status -ne 'AlreadyInstalled' })
+
+            if ($found.Count -eq 0) {
+                # LIST gave no WMI result -> do not trust it, install anyway (TVSU skips installed items)
+                Write-Log 'LIST lieferte keine WMI-Ergebnisse - Installation wird trotzdem ausgefuehrt.' -Severity 'Warning'
+                $Phase = 'Install'
+            }
+            elseif ($pending.Count -eq 0) {
+                Write-Log 'Alle Lenovo Treiber/Updates sind bereits installiert.'
+                $Phase = 'Nvidia'
+            }
+            else {
+                Write-Log ("Verfuegbare Updates ({0}): {1}" -f $pending.Count, (($pending.Title) -join '; '))
+                $Phase = 'Install'
+            }
+        }
+
+        'Install' {
+            if ($AllowBios) { $BitLockerPaused = Suspend-BitLockerOnce }
+
+            Set-TvsuCommandLine -Action 'INSTALL' -PackageTypes $PackageTypes -Repository $Device.Repository
+            Clear-TvsuResults
+
+            $statusText = if ($AllowBios) { 'Treiber, BIOS und Firmware werden installiert. Bitte das Geraet nicht ausschalten...' }
+                          else            { 'Treiber werden installiert. Bitte das Geraet nicht ausschalten...' }
+
+            if (-not (Invoke-Tvsu -StatusMessage $statusText)) {
+                $ExitCode = 60004; $Phase = 'Done'; continue
+            }
+            $Phase = 'Nvidia'
+        }
+
+        'Nvidia' {
+            if ($Device.HasNvidia) {
+                # Driver first, then the Control Panel (needs the driver)
+                $nvResult = Install-NvidiaDisplayDriver -Repository $Device.Repository
+                switch ($nvResult) {
+                    'Installed' { $NvidiaChanged = $true }
+                    'Reboot'    { $NvidiaChanged = $true; $RebootNeeded = $true }
+                    'Failed'    { $NvidiaFailed  = $true }
+                }
+
+                Install-NvidiaControlPanel -Repository $Device.Repository
+
+                $nvActive = Get-CimInstance -ClassName Win32_VideoController |
+                            Where-Object { $_.Name -like '*NVIDIA*' -and $_.ConfigManagerErrorCode -eq 0 }
+                if ($nvActive)         { Write-Log "NVIDIA-Treiber aktiv: $($nvActive.Name) $($nvActive.DriverVersion)" }
+                elseif ($RebootNeeded) { Write-Log 'NVIDIA-Treiber wird nach dem Neustart aktiv.' }
+                else                   { Write-Log 'NVIDIA-GPU vorhanden, aber kein funktionierender NVIDIA-Treiber!' -Severity 'Warning' }
+            }
+            else {
+                Write-Log 'Keine NVIDIA-GPU - NVIDIA Treiber und Control Panel werden nicht installiert.'
+            }
+            $Phase = 'Evaluate'
+        }
+
+        'Evaluate' {
+            $results = Get-TvsuResults
+            $success = @($results | Where-Object Status -eq 'InstallSuccess')
+            $failed  = @($results | Where-Object { $_.Status -notin 'InstallSuccess','AlreadyInstalled' })
+
+            if ($success.Count -gt 0) {
+                Write-Log ("Erfolgreich installiert ({0}): {1}" -f $success.Count, (($success.Title) -join '; '))
+                $RebootNeeded = $true
+            }
+            if ($failed.Count -gt 0) {
+                Write-Log ("Nicht installiert ({0}): {1}" -f $failed.Count, (($failed | ForEach-Object { "$($_.Title) [$($_.Status)]" }) -join '; ')) -Severity 'Error'
+            }
+
+            Close-ADTInstallationProgress
+
+            if ($RebootNeeded) {
+                $Phase = 'Reboot'
+            }
+            else {
+                if ($failed.Count -gt 0 -or $NvidiaFailed) {
+                    Show-ADTInstallationPrompt -Message 'Fehler: Updates konnten nicht installiert werden. Siehe Log C:\Logs\Lenovo_Install_Drivers.log' -ButtonRightText 'OK'
+                    $ExitCode = 60005
+                }
+                elseif ($NvidiaChanged) {
+                    Show-ADTInstallationPrompt -Message 'Information: Der NVIDIA Grafiktreiber wurde aktualisiert.' -ButtonRightText 'OK'
+                }
+                else {
+                    Show-ADTInstallationPrompt -Message 'Information: Alle Treiber sind aktuell. Es wurden keine Updates installiert.' -ButtonRightText 'OK'
+                }
+
+                # No restart -> switch BitLocker back on
+                if ($BitLockerPaused) { Resume-BitLocker -MountPoint 'C:' -ErrorAction SilentlyContinue | Out-Null }
+                $Phase = 'Done'
+            }
+        }
+
+        'Reboot' {
+            Write-Log 'Neustart erforderlich - Neustart-Aufforderung wird angezeigt.'
+            # BitLocker stays suspended for exactly this one restart and resumes automatically
+            Show-ADTInstallationRestartPrompt -CountdownSeconds 900 -CountdownNoHideSeconds 300
+            $ExitCode = 3010
+            $Phase = 'Done'
+        }
+    }
+}
+
+Close-ADTInstallationProgress -ErrorAction SilentlyContinue
+Write-Log "Skript beendet mit Exit-Code $ExitCode"
+exit $ExitCode
+#endregion
