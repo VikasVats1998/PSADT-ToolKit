@@ -14,7 +14,7 @@
         20YQ* / 20YR*  ThinkPad P15 Gen 2            Laptop    NVIDIA (T1200 / RTX A-Serie)
         11TB*          Modell noch pruefen           Platzhalter
 
-    Repository-Suche (Lenovo_Repository\...):
+    Repository-Suche (Lenovo_Repository im Skript-, Eltern- oder Arbeitsordner):
         1. <BoardID>_W11        z.B. 330B_W11
         2. <MTM>_W11            z.B. 20YRS7PD00_W11
         3. <MTM 4 Zeichen>*_W11 z.B. 20YR*_W11
@@ -35,13 +35,14 @@
 $LogFilePath       = 'C:\Logs'
 $LogFile           = 'Lenovo_Install_Drivers.log'
 $ScriptVersion     = '21-10-2026'
-$CurrentPath       = $PSScriptRoot
 $TvsuExe           = "${env:ProgramFiles(x86)}\Lenovo\System Update\tvsu.exe"
 $TvsuPolicyKey     = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
 $TvsuPrefsKey      = 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings'
 $TvsuTimeoutMin    = 55      # max runtime of TVSU per run
+$MsiWaitMin        = 10      # max wait for running MSI installations after TVSU
 $MinBatteryPercent = 30      # min charge for BIOS update on laptops
 $ChargerRetries    = 3       # how often the user is asked to plug in the charger
+$BitLockerReboots  = 2       # BitLocker suspended for this many restarts
 $UseListCheck      = $true   # pre-check with "-action LIST"; set $false if LIST does not fill WMI
 #endregion
 
@@ -65,9 +66,20 @@ function Test-NvidiaGpu {
     return [bool]$gpu
 }
 
+function Get-RepositoryRoot {
+    # Search like the old script ($pwd), plus script folder and its parent
+    foreach ($base in @($PSScriptRoot, (Split-Path -Path $PSScriptRoot -Parent), $PWD.Path)) {
+        if ($base -and (Test-Path -Path (Join-Path $base 'Lenovo_Repository'))) {
+            return (Join-Path $base 'Lenovo_Repository')
+        }
+    }
+    return $null
+}
+
 function Find-Repository {
     param([string]$Board, [string]$Mtm)
-    $root = Join-Path $CurrentPath 'Lenovo_Repository'
+    $root = Get-RepositoryRoot
+    if (-not $root) { return $null }
 
     foreach ($name in @("$($Board)_W11", "$($Mtm)_W11")) {
         $path = Join-Path $root $name
@@ -180,9 +192,11 @@ function Confirm-PowerForBios {
 function Initialize-TvsuSettings {
     $src = 'Initialize-TvsuSettings'
 
+    # Policy keys (not redirected, same for 32/64 bit)
     Remove-Item -Path 'HKLM:\SOFTWARE\Policies\Lenovo' -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -Path $TvsuPolicyKey -Force | Out-Null
 
+    # TVSU preferences (32-bit app -> WOW6432Node, see $TvsuPrefsKey)
     Set-ItemProperty -Path "$TvsuPrefsKey\Scheduler" -Name 'SchedulerAbility' -Value 'NO' -ErrorAction SilentlyContinue
 
     $general = "$TvsuPrefsKey\General"
@@ -214,6 +228,7 @@ function Set-TvsuCommandLine {
            "-noreboot -noicon -repository $Repository -nolicense -exporttowmi"
 
     New-ItemProperty -Path $TvsuPolicyKey -Name 'AdminCommandLine' -PropertyType String -Value $cmd -Force | Out-Null
+    Set-ItemProperty -Path "$TvsuPrefsKey\General" -Name 'RepositoryLocation1' -Value $Repository -ErrorAction SilentlyContinue
     Write-Log "TVSU AdminCommandLine: $cmd" 'Set-TvsuCommandLine'
 }
 
@@ -250,6 +265,12 @@ function Invoke-Tvsu {
             return $false
         }
         Start-Sleep -Seconds 15
+    }
+
+    # Wait for running MSI installations (old script: -WaitForMsiExec)
+    $msiDeadline = (Get-Date).AddMinutes($MsiWaitMin)
+    while (-not (Test-ADTMutexAvailability -MutexName 'Global\_MSIExecute') -and (Get-Date) -lt $msiDeadline) {
+        Start-Sleep -Seconds 10
     }
 
     Write-Log 'TVSU-Prozess beendet.' $src
@@ -368,13 +389,13 @@ function Install-NvidiaControlPanel {
 #endregion
 
 #region BitLocker
-function Suspend-BitLockerOnce {
-    $src = 'Suspend-BitLockerOnce'
+function Suspend-BitLockerForUpdate {
+    $src = 'Suspend-BitLockerForUpdate'
     try {
         $vol = Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop
         if ($vol.ProtectionStatus -eq 'On') {
-            Suspend-BitLocker -MountPoint 'C:' -RebootCount 1 -ErrorAction Stop | Out-Null
-            Write-Log 'BitLocker fuer 1 Neustart angehalten (BIOS-Update).' $src
+            Suspend-BitLocker -MountPoint 'C:' -RebootCount $BitLockerReboots -ErrorAction Stop | Out-Null
+            Write-Log "BitLocker fuer $BitLockerReboots Neustarts angehalten (BIOS/Firmware-Update)." $src
             return $true
         }
         Write-Log "BitLocker-Schutz ist bereits '$($vol.ProtectionStatus)'." $src
@@ -402,6 +423,10 @@ while ($Phase -ne 'Done') {
         'Init' {
             Write-Log "Lenovo Treiber-Skript gestartet - Version $ScriptVersion"
 
+            $loggedOnUser = (Get-Process -IncludeUserName -Name explorer -ErrorAction SilentlyContinue |
+                             Select-Object -ExpandProperty UserName -Unique) -join ', '
+            Write-Log "Angemeldeter Benutzer: $(if ($loggedOnUser) { $loggedOnUser } else { 'keiner' })"
+
             if (-not (Test-Path -Path $TvsuExe)) {
                 $msg = 'Fehler: Lenovo System Update (tvsu.exe) wurde nicht gefunden. Das Programm wird beendet.'
                 Show-ADTInstallationPrompt -Message $msg -ButtonRightText 'OK'
@@ -427,7 +452,7 @@ while ($Phase -ne 'Done') {
                 Write-Log "$msg (Board: $($Device.Board), MTM: $($Device.Mtm))" -Severity 'Error'
                 $ExitCode = 60002; $Phase = 'Done'; continue
             }
-            Write-Log "Repository: $($Device.Repository)"
+            Write-Log "Das Lenovo Treiber Repository liegt unter $($Device.Repository)"
 
             Initialize-TvsuSettings
             $Phase = 'CheckPower'
@@ -468,7 +493,7 @@ while ($Phase -ne 'Done') {
         }
 
         'Install' {
-            if ($AllowBios) { $BitLockerPaused = Suspend-BitLockerOnce }
+            if ($AllowBios) { $BitLockerPaused = Suspend-BitLockerForUpdate }
 
             Set-TvsuCommandLine -Action 'INSTALL' -PackageTypes $PackageTypes -Repository $Device.Repository
             Clear-TvsuResults
@@ -509,14 +534,19 @@ while ($Phase -ne 'Done') {
         'Evaluate' {
             $results = Get-TvsuResults
             $success = @($results | Where-Object Status -eq 'InstallSuccess')
-            $failed  = @($results | Where-Object { $_.Status -notin 'InstallSuccess','AlreadyInstalled' })
+
+            # Only count as error if the package really exists in the repository (as in the old script)
+            $failed  = @($results | Where-Object {
+                           $_.Status -notin 'InstallSuccess','AlreadyInstalled' -and
+                           (Test-Path -Path (Join-Path $Device.Repository $_.PackageID))
+                       })
 
             if ($success.Count -gt 0) {
                 Write-Log ("Erfolgreich installiert ({0}): {1}" -f $success.Count, (($success.Title) -join '; '))
                 $RebootNeeded = $true
             }
             if ($failed.Count -gt 0) {
-                Write-Log ("Nicht installiert ({0}): {1}" -f $failed.Count, (($failed | ForEach-Object { "$($_.Title) [$($_.Status)]" }) -join '; ')) -Severity 'Error'
+                Write-Log ("Folgende Updates wurden uebersprungen und nicht installiert ({0}): {1}" -f $failed.Count, (($failed | ForEach-Object { "$($_.Title) [$($_.Status)]" }) -join '; ')) -Severity 'Error'
             }
 
             Close-ADTInstallationProgress
@@ -533,7 +563,7 @@ while ($Phase -ne 'Done') {
                     Show-ADTInstallationPrompt -Message 'Information: Der NVIDIA Grafiktreiber wurde aktualisiert.' -ButtonRightText 'OK'
                 }
                 else {
-                    Show-ADTInstallationPrompt -Message 'Information: Alle Treiber sind aktuell. Es wurden keine Updates installiert.' -ButtonRightText 'OK'
+                    Show-ADTInstallationPrompt -Message 'Information: Es wurden keine weiteren Updates installiert. Alle Treiber sind aktuell.' -ButtonRightText 'OK'
                 }
 
                 # No restart -> switch BitLocker back on
@@ -544,7 +574,7 @@ while ($Phase -ne 'Done') {
 
         'Reboot' {
             Write-Log 'Neustart erforderlich - Neustart-Aufforderung wird angezeigt.'
-            # BitLocker stays suspended for exactly this one restart and resumes automatically
+            # BitLocker stays suspended for the set number of restarts and resumes automatically
             Show-ADTInstallationRestartPrompt -CountdownSeconds 900 -CountdownNoHideSeconds 300
             $ExitCode = 3010
             $Phase = 'Done'
