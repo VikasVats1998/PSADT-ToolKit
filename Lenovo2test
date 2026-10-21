@@ -1,6 +1,9 @@
 <#
     Install_Drivers.ps1
     Lenovo Treiber / BIOS / Firmware ueber Lenovo System Update (TVSU) - PSADT v4
+    Treiber, BIOS und Firmware werden immer zusammen installiert.
+    Laptops nur mit angeschlossenem Netzteil, sonst Abbruch ohne Installation.
+
     Aufruf aus Invoke-AppDeployToolkit.ps1 (Install-Phase):
         & "$PSScriptRoot\Install_Drivers.ps1"
         Close-ADTSession -ExitCode $LASTEXITCODE
@@ -27,6 +30,7 @@
         60003  Geraet nicht unterstuetzt
         60004  TVSU Timeout
         60005  Updates fehlgeschlagen
+        60006  Laptop ohne Netzteil - nichts installiert, spaeter erneut versuchen
 
     Version: 21-10-2026
 #>
@@ -38,12 +42,13 @@ $ScriptVersion     = '21-10-2026'
 $TvsuExe           = "${env:ProgramFiles(x86)}\Lenovo\System Update\tvsu.exe"
 $TvsuPolicyKey     = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
 $TvsuPrefsKey      = 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings'
-$TvsuTimeoutMin    = 55      # max runtime of TVSU per run
-$MsiWaitMin        = 10      # max wait for running MSI installations after TVSU
-$MinBatteryPercent = 30      # min charge for BIOS update on laptops
-$ChargerRetries    = 3       # how often the user is asked to plug in the charger
-$BitLockerReboots  = 2       # BitLocker suspended for this many restarts
-$UseListCheck      = $true   # pre-check with "-action LIST"; set $false if LIST does not fill WMI
+$PackageTypes      = '1,2,3,4' # 1 = Application, 2 = Driver, 3 = BIOS, 4 = Firmware - always together
+$TvsuTimeoutMin    = 55        # max runtime of TVSU per run
+$MsiWaitMin        = 10        # max wait for running MSI installations after TVSU
+$MinBatteryPercent = 30        # min charge on laptops
+$ChargerRetries    = 3         # how often the user is asked to plug in the charger
+$BitLockerReboots  = 2         # BitLocker suspended for this many restarts
+$UseListCheck      = $true     # pre-check with "-action LIST"; set $false if LIST does not fill WMI
 #endregion
 
 #region Allgemeine Funktionen
@@ -149,12 +154,13 @@ function Get-PowerState {
     [pscustomobject]@{ HasBattery = $true; OnAC = $onAC; Charge = $charge }
 }
 
-function Confirm-PowerForBios {
+function Confirm-PowerSupply {
+    # Returns $true only if the device is safely on mains power
     param($Device)
-    $src = 'Confirm-PowerForBios'
+    $src = 'Confirm-PowerSupply'
 
     if (-not $Device.IsLaptop) {
-        Write-Log "Desktop-Geraet ($($Device.Name)) - Netzbetrieb, BIOS/Firmware-Updates erlaubt." $src
+        Write-Log "Desktop-Geraet ($($Device.Name)) - Netzbetrieb, Installation erlaubt." $src
         return $true
     }
 
@@ -163,27 +169,27 @@ function Confirm-PowerForBios {
         Write-Log "Pruefung $i/$ChargerRetries - Netzteil: $($power.OnAC), Akku: $($power.Charge)%" $src
 
         if ($power.OnAC -and $power.Charge -ge $MinBatteryPercent) {
-            Write-Log 'Netzteil angeschlossen und Akku ausreichend - BIOS/Firmware-Updates erlaubt.' $src
+            Write-Log 'Netzteil angeschlossen und Akku ausreichend - Installation erlaubt.' $src
             return $true
         }
 
         if (-not $power.OnAC) {
-            $msg = "Das Geraet laeuft im Akkubetrieb.`n`nBitte schliessen Sie jetzt das Netzteil an, damit auch BIOS- und Firmware-Updates installiert werden koennen."
+            $msg = "Das Geraet laeuft im Akkubetrieb.`n`nTreiber und BIOS werden nur mit angeschlossenem Netzteil installiert. Bitte schliessen Sie jetzt das Netzteil an."
         } else {
             $msg = "Der Akku ist nur zu $($power.Charge)% geladen (mindestens $MinBatteryPercent% noetig).`n`nBitte lassen Sie das Netzteil angeschlossen und pruefen Sie in einigen Minuten erneut."
         }
 
         # No -Icon: not supported with the Fluent UI in config.psd1
-        $answer = Show-ADTInstallationPrompt -Message $msg -ButtonLeftText 'Ohne BIOS' `
+        $answer = Show-ADTInstallationPrompt -Message $msg -ButtonLeftText 'Abbrechen' `
                     -ButtonRightText 'Erneut pruefen' -Timeout 300 -NoExitOnTimeout -PersistPrompt
 
-        if ($answer -eq 'Ohne BIOS') {
-            Write-Log 'Benutzer hat "Ohne BIOS" gewaehlt.' $src 'Warning'
+        if ($answer -eq 'Abbrechen') {
+            Write-Log 'Benutzer hat die Installation abgebrochen.' $src 'Warning'
             break
         }
     }
 
-    Write-Log 'Kein sicherer Netzbetrieb - es werden nur Treiber und Anwendungen installiert, KEIN BIOS/Firmware.' $src 'Warning'
+    Write-Log 'Kein sicherer Netzbetrieb - es wird NICHTS installiert.' $src 'Warning'
     return $false
 }
 #endregion
@@ -220,10 +226,8 @@ function Initialize-TvsuSettings {
 function Set-TvsuCommandLine {
     param(
         [ValidateSet('LIST','INSTALL')][string]$Action,
-        [string]$PackageTypes,
         [string]$Repository
     )
-    # PackageTypes: 1 = Application, 2 = Driver, 3 = BIOS, 4 = Firmware
     $cmd = "/CM -search A -action $Action -packagetypes $PackageTypes -includerebootpackages 1,3,4,5 " +
            "-noreboot -noicon -repository $Repository -nolicense -exporttowmi"
 
@@ -409,8 +413,6 @@ function Suspend-BitLockerForUpdate {
 #region Hauptprogramm
 $Phase           = 'Init'
 $ExitCode        = 0
-$AllowBios       = $false
-$PackageTypes    = '1,2'
 $BitLockerPaused = $false
 $RebootNeeded    = $false
 $NvidiaChanged   = $false
@@ -454,20 +456,26 @@ while ($Phase -ne 'Done') {
             }
             Write-Log "Das Lenovo Treiber Repository liegt unter $($Device.Repository)"
 
-            Initialize-TvsuSettings
             $Phase = 'CheckPower'
         }
 
         'CheckPower' {
-            $AllowBios    = Confirm-PowerForBios -Device $Device
-            $PackageTypes = if ($AllowBios) { '1,2,3,4' } else { '1,2' }
-            $Phase = 'CheckUpdates'
+            if (Confirm-PowerSupply -Device $Device) {
+                Initialize-TvsuSettings
+                $Phase = 'CheckUpdates'
+            }
+            else {
+                $msg = "Die Installation wurde abgebrochen, da kein Netzteil angeschlossen ist.`n`nEs wurde nichts installiert. Bitte schliessen Sie das Netzteil an und starten Sie die Installation spaeter erneut ueber das Softwarecenter."
+                Show-ADTInstallationPrompt -Message $msg -ButtonRightText 'OK'
+                Write-Log 'Abbruch: Laptop ohne Netzteil - keine Installation.' -Severity 'Warning'
+                $ExitCode = 60006; $Phase = 'Done'
+            }
         }
 
         'CheckUpdates' {
             if (-not $UseListCheck) { $Phase = 'Install'; continue }
 
-            Set-TvsuCommandLine -Action 'LIST' -PackageTypes $PackageTypes -Repository $Device.Repository
+            Set-TvsuCommandLine -Action 'LIST' -Repository $Device.Repository
             Clear-TvsuResults
 
             if (-not (Invoke-Tvsu -StatusMessage 'Suche nach Treiber- und BIOS-Updates...')) {
@@ -493,15 +501,12 @@ while ($Phase -ne 'Done') {
         }
 
         'Install' {
-            if ($AllowBios) { $BitLockerPaused = Suspend-BitLockerForUpdate }
+            $BitLockerPaused = Suspend-BitLockerForUpdate
 
-            Set-TvsuCommandLine -Action 'INSTALL' -PackageTypes $PackageTypes -Repository $Device.Repository
+            Set-TvsuCommandLine -Action 'INSTALL' -Repository $Device.Repository
             Clear-TvsuResults
 
-            $statusText = if ($AllowBios) { 'Treiber, BIOS und Firmware werden installiert. Bitte das Geraet nicht ausschalten...' }
-                          else            { 'Treiber werden installiert. Bitte das Geraet nicht ausschalten...' }
-
-            if (-not (Invoke-Tvsu -StatusMessage $statusText)) {
+            if (-not (Invoke-Tvsu -StatusMessage 'Treiber, BIOS und Firmware werden installiert. Bitte das Geraet nicht ausschalten...')) {
                 $ExitCode = 60004; $Phase = 'Done'; continue
             }
             $Phase = 'Nvidia'
