@@ -600,3 +600,50 @@ Close-ADTInstallationProgress -ErrorAction SilentlyContinue
 Write-Log "Skript beendet mit Exit-Code $ExitCode"
 exit $ExitCode
 #endregion
+
+
+
+
+
+function Find-Repository {
+    # Picks the repository whose database.xml lists this machine type (same check as TVSU)
+    param([string]$MachineType)
+    $root = Get-RepositoryRoot
+    if (-not $root) { return $null }
+
+    foreach ($dir in Get-ChildItem -Path $root -Directory) {
+        $db = Join-Path $dir.FullName 'database.xml'
+        if (-not (Test-Path -Path $db)) { continue }
+        try { [xml]$xml = Get-Content -Path $db -Raw -Encoding UTF8 } catch { continue }
+
+        $types = $xml.SelectNodes('//SystemCompatibility/System') |
+                 ForEach-Object { $_.mtm.ToUpper() } | Sort-Object -Unique
+        if ($types -contains $MachineType) {
+            Write-Log "Repository $($dir.Name) passt zu Maschinentyp $MachineType (laut database.xml)." 'Find-Repository'
+            return $dir.FullName
+        }
+    }
+    return $null
+}
+
+function Get-DeviceProfile {
+    $cs = Get-CimInstance -ClassName Win32_ComputerSystem
+    if ($cs.Manufacturer -notlike '*LENOVO*') { return $null }
+
+    $board  = ((Get-CimInstance -ClassName Win32_BaseBoard).Product).Trim()
+    $mtm    = $cs.Model.Trim()                                         # e.g. 11TBS0AB00
+    $mt     = $mtm.Substring(0, [Math]::Min(4, $mtm.Length)).ToUpper() # e.g. 11TB
+    $model  = (Get-CimInstance -ClassName Win32_ComputerSystemProduct).Version
+    $laptop = [bool](Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue)
+
+    [pscustomobject]@{
+        Board       = $board
+        Mtm         = $mtm
+        MachineType = $mt
+        Model       = $model
+        Name        = $model
+        IsLaptop    = $laptop
+        HasNvidia   = Test-NvidiaGpu
+        Repository  = Find-Repository -MachineType $mt
+    }
+}
