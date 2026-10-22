@@ -17,10 +17,15 @@
         20YQ* / 20YR*  ThinkPad P15 Gen 2            Laptop    NVIDIA (T1200 / RTX A-Serie)
         11TB*          Modell noch pruefen           Platzhalter
 
+    NVIDIA (nur Geraete mit NVIDIA-GPU):
+        Grafiktreiber  -> ueber TVSU (Paket "ThinkPad Video Features")
+                          Fallback: nv*.inf unter Nvidia Treiber\Display.Driver (pnputil)
+        Control Panel  -> Nvidia Treiber\Display.Driver\NVCPL (*.appx + *_License1.xml)
+
     Repository-Suche (Lenovo_Repository im Skript-, Eltern- oder Arbeitsordner):
         1. <BoardID>_W11        z.B. 330B_W11
         2. <MTM>_W11            z.B. 20YRS7PD00_W11
-        3. <MTM 4 Zeichen>*_W11 z.B. 20YR*_W11
+        3. <MTM 4 Zeichen>*_W11 z.B. 20YR_W11
 
     Exit-Codes (vom Skript gesetzt, TVSU liefert keine):
         0      Nichts zu tun / installiert ohne Neustart
@@ -32,13 +37,13 @@
         60005  Updates fehlgeschlagen
         60006  Laptop ohne Netzteil - nichts installiert, spaeter erneut versuchen
 
-    Version: 21-10-2026
+    Version: 22-10-2026
 #>
 
 #region Variablen
 $LogFilePath       = 'C:\Logs'
 $LogFile           = 'Lenovo_Install_Drivers.log'
-$ScriptVersion     = '21-10-2026'
+$ScriptVersion     = '22-10-2026'
 $TvsuExe           = "${env:ProgramFiles(x86)}\Lenovo\System Update\tvsu.exe"
 $TvsuPolicyKey     = 'HKLM:\SOFTWARE\Policies\Lenovo\System Update\UserSettings\General'
 $TvsuPrefsKey      = 'HKLM:\SOFTWARE\WOW6432Node\Lenovo\System Update\Preferences\UserSettings'
@@ -303,6 +308,7 @@ function Get-InstalledNvidiaDriverVersion {
 }
 
 function Install-NvidiaDisplayDriver {
+    # Fallback only - normally the driver comes via TVSU (ThinkPad Video Features)
     # Returns: 'None', 'Installed', 'Reboot' or 'Failed'
     param([string]$Repository)
     $src        = 'Install-NvidiaDisplayDriver'
@@ -310,7 +316,7 @@ function Install-NvidiaDisplayDriver {
 
     $infs = Get-ChildItem -Path $driverPath -Filter 'nv*.inf' -File -ErrorAction SilentlyContinue
     if (-not $infs) {
-        Write-Log "Keine NVIDIA INF-Dateien unter $driverPath gefunden - Grafiktreiber wird uebersprungen." $src 'Warning'
+        Write-Log "Keine NVIDIA INF-Dateien unter $driverPath - Grafiktreiber kommt ueber TVSU (ThinkPad Video Features)." $src
         return 'None'
     }
 
@@ -514,7 +520,7 @@ while ($Phase -ne 'Done') {
 
         'Nvidia' {
             if ($Device.HasNvidia) {
-                # Driver first, then the Control Panel (needs the driver)
+                # Driver (fallback, normally via TVSU) first, then the Control Panel
                 $nvResult = Install-NvidiaDisplayDriver -Repository $Device.Repository
                 switch ($nvResult) {
                     'Installed' { $NvidiaChanged = $true }
@@ -524,11 +530,14 @@ while ($Phase -ne 'Done') {
 
                 Install-NvidiaControlPanel -Repository $Device.Repository
 
-                $nvActive = Get-CimInstance -ClassName Win32_VideoController |
-                            Where-Object { $_.Name -like '*NVIDIA*' -and $_.ConfigManagerErrorCode -eq 0 }
-                if ($nvActive)         { Write-Log "NVIDIA-Treiber aktiv: $($nvActive.Name) $($nvActive.DriverVersion)" }
-                elseif ($RebootNeeded) { Write-Log 'NVIDIA-Treiber wird nach dem Neustart aktiv.' }
-                else                   { Write-Log 'NVIDIA-GPU vorhanden, aber kein funktionierender NVIDIA-Treiber!' -Severity 'Warning' }
+                # Check the driver; after a TVSU install it often becomes active only after restart
+                $nvActive      = Get-CimInstance -ClassName Win32_VideoController |
+                                 Where-Object { $_.Name -like '*NVIDIA*' -and $_.ConfigManagerErrorCode -eq 0 }
+                $tvsuInstalled = @(Get-TvsuResults | Where-Object Status -eq 'InstallSuccess').Count -gt 0
+
+                if ($nvActive)                            { Write-Log "NVIDIA-Treiber aktiv: $($nvActive.Name) $($nvActive.DriverVersion)" }
+                elseif ($RebootNeeded -or $tvsuInstalled) { Write-Log 'NVIDIA-Treiber wird nach dem Neustart aktiv.' }
+                else                                      { Write-Log 'NVIDIA-GPU vorhanden, aber kein funktionierender NVIDIA-Treiber!' -Severity 'Warning' }
             }
             else {
                 Write-Log 'Keine NVIDIA-GPU - NVIDIA Treiber und Control Panel werden nicht installiert.'
